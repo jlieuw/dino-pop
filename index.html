@@ -87,7 +87,16 @@
 <script>
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
-const W = canvas.width, H = canvas.height;
+const W = 560, H = 720;
+
+// ── HiDPI: scale the backing store so everything renders crisp ───────────────
+const DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+canvas.style.width = W + 'px';
+canvas.style.height = H + 'px';
+canvas.width = Math.round(W * DPR);
+canvas.height = Math.round(H * DPR);
+ctx.scale(DPR, DPR);          // base transform persists across frames (draw() is save/restore balanced)
+ctx.imageSmoothingEnabled = true;
 
 // ───────────────────────────── geometry ─────────────────────────────
 const MARGIN = 16;
@@ -97,8 +106,8 @@ const TOP_Y = 60;                   // y-center of row 0
 const ROW_H = Math.round(D * 0.866);
 const LAUNCH_X = W / 2, LAUNCH_Y = H - 56;
 const DANGER_Y = H - 150;
-const L_WALL = MARGIN, R_WALL = W - MARGIN;
 const CLAMP_MIN = MARGIN + R, CLAMP_MAX = W - MARGIN - R;
+const CEIL_Y = TOP_Y - ROW_H * 0.5;
 
 // ───────────────────────────── palette ──────────────────────────────
 const PALETTE = [
@@ -121,47 +130,26 @@ let queue = [];         // upcoming eggs [loaded, next]
 let proj = null;        // flying egg
 let aimAngle = -Math.PI / 2;
 let running = false, paused = false;
-let particles = [], popping = [], falling = [], floaters = [];
+let particles = [], popping = [], falling = [], scorePops = [];
 let shake = 0, flash = 0;
 let whirley = null, whirleyTimer = 0, whirleyMsg = 0;
+let comboMsg = 0, comboMsgT = 0;
 let foot = null;        // mama stomp animation
 let descendEvery = 6;   // shots between descents
 let animId = null, lastT = 0;
-let scorePops = [];
+let recoil = 0;         // dino kick on fire
+let slide = 0;          // smooth-descend visual offset (px, <=0)
+let hitstop = 0;        // brief freeze for impact
+let gridVer = 0;        // bumped on any grid mutation (aim cache invalidation)
 
-// ───────────────────────────── audio ────────────────────────────────
-let audioOn = true, actx = null;
-function ensureAudio(){ if(!actx){ try{ actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ audioOn=false; } } }
-function tone(freq, dur, type='sine', vol=0.15, slideTo=null){
-  if(!audioOn || !actx) return;
-  const o = actx.createOscillator(), g = actx.createGain();
-  o.type = type; o.frequency.value = freq;
-  if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime + dur);
-  g.gain.value = vol; g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
-  o.connect(g); g.connect(actx.destination);
-  o.start(); o.stop(actx.currentTime + dur);
-}
-function sfxShoot(){ tone(420, 0.12, 'square', 0.08, 680); }
-function sfxPop(n){ tone(500 + n*60, 0.14, 'triangle', 0.14, 900 + n*80); }
-function sfxDrop(){ tone(300, 0.25, 'sine', 0.1, 90); }
-function sfxThunder(){ tone(80, 0.5, 'sawtooth', 0.2, 40); }
-function sfxStomp(){ tone(60, 0.6, 'sawtooth', 0.3, 30); }
-function sfxClick(){ tone(660, 0.08, 'square', 0.08); }
-
-// ───────────────────────────── helpers ──────────────────────────────
+// ───────────────────────────── easing / helpers ─────────────────────
 const rnd = (a,b)=> a + Math.random()*(b-a);
 const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
 function randColor(){ return Math.floor(Math.random()*numColors); }
+function easeOutBack(t){ const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(t-1,3) + c1*Math.pow(t-1,2); }
+function touchGrid(){ gridVer++; }
 
-function makeEgg(color){
-  const spots = [];
-  const n = 3 + Math.floor(Math.random()*3);
-  for(let i=0;i<n;i++){
-    const a = Math.random()*Math.PI*2, rr = Math.random()*R*0.55;
-    spots.push({ dx: Math.cos(a)*rr, dy: Math.sin(a)*rr*1.15, r: 1.5+Math.random()*2.5 });
-  }
-  return { color, spots, wob: Math.random()*Math.PI*2 };
-}
+function makeEgg(color){ return { color, wob: Math.random()*Math.PI*2, appear: 1 }; }
 
 function parityEven(r){ return ((r + rowParity) & 1) === 0; }
 function colsForRow(r){ return parityEven(r) ? COLS_EVEN : COLS_ODD; }
@@ -179,6 +167,164 @@ function neighbors(r,c){
 function emptyRowAt(idx){ return new Array(colsForRow(idx)).fill(null); }
 function ensureRows(upto){ while(grid.length <= upto) grid.push(emptyRowAt(grid.length)); }
 
+// ═════════════════════════ AUDIO (improved) ═════════════════════════
+let audioOn = true, actx = null, master = null, noiseBuf = null, pad = null;
+function ensureAudio(){
+  if(actx) return;
+  try{
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = 0.85;
+    const comp = actx.createDynamicsCompressor();
+    master.connect(comp); comp.connect(actx.destination);
+  }catch(e){ audioOn = false; }
+}
+function getNoise(){
+  if(noiseBuf || !actx) return noiseBuf;
+  const len = Math.floor(actx.sampleRate*0.4);
+  noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+  return noiseBuf;
+}
+function tone(freq, dur, type='sine', vol=0.15, slideTo=null){
+  if(!audioOn || !actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.value = freq;
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime + dur);
+  g.gain.value = vol; g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+  o.connect(g); g.connect(master);
+  o.start(); o.stop(actx.currentTime + dur);
+}
+function noiseHit(dur, vol, freq, q=1){
+  if(!audioOn || !actx) return;
+  const s = actx.createBufferSource(); s.buffer = getNoise();
+  const f = actx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=freq; f.Q.value=q;
+  const g = actx.createGain(); g.gain.value=vol; g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime+dur);
+  s.connect(f); f.connect(g); g.connect(master);
+  s.start(); s.stop(actx.currentTime+dur);
+}
+function sfxShoot(){ noiseHit(0.09,0.10,1200,0.7); tone(380,0.10,'square',0.05,620); }
+function sfxPop(n){ tone(440+n*55,0.14,'triangle',0.13,820+n*70); noiseHit(0.07,0.06,1600,1.2); }
+function sfxDrop(){ tone(280,0.28,'sine',0.10,80); }
+function sfxThunder(){ noiseHit(0.5,0.18,140,0.4); tone(70,0.5,'sawtooth',0.18,38); }
+function sfxStomp(){ noiseHit(0.5,0.3,90,0.3); tone(55,0.6,'sawtooth',0.28,28); }
+function sfxClick(){ tone(680,0.07,'square',0.07); }
+// subtle ambient pad
+function ensurePad(){
+  if(pad || !actx) return;
+  try{
+    const g = actx.createGain(); g.gain.value=0; g.connect(master);
+    const f = actx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=520; f.Q.value=4; f.connect(g);
+    const o1 = actx.createOscillator(); o1.type='sawtooth'; o1.frequency.value=55;
+    const o2 = actx.createOscillator(); o2.type='sawtooth'; o2.frequency.value=82.4; o2.detune.value=7;
+    o1.connect(f); o2.connect(f);
+    const lfo = actx.createOscillator(); lfo.frequency.value=0.06;
+    const lg = actx.createGain(); lg.gain.value=160; lfo.connect(lg); lg.connect(f.frequency);
+    o1.start(); o2.start(); lfo.start();
+    pad = { g };
+  }catch(e){ pad = null; }
+}
+function syncMusic(){
+  ensureAudio(); ensurePad();
+  if(!pad || !actx) return;
+  const on = running && !paused && audioOn;
+  pad.g.gain.cancelScheduledValues(actx.currentTime);
+  pad.g.gain.linearRampToValueAtTime(on?0.045:0.0001, actx.currentTime+0.6);
+}
+
+// ═════════════════════════ SPRITE CACHE ═════════════════════════════
+// Pre-render each egg colour (and the colour-blind symbol) once, so the
+// per-frame cost is a cheap drawImage instead of a fresh radial gradient.
+const EGG_HW = R*0.86, EGG_HH = R*1.08;
+const SPR_PAD = 7;
+const SPR_W = Math.ceil(EGG_HW*2 + SPR_PAD*2);
+const SPR_H = Math.ceil(EGG_HH*2 + SPR_PAD*2);
+let eggSprites = [];
+function lcg(seed){ let s=seed%2147483647; if(s<=0)s+=2147483646; return ()=> (s=s*16807%2147483647)/2147483647; }
+
+function buildEggSprite(color){
+  const cv = document.createElement('canvas');
+  cv.width = Math.ceil(SPR_W*DPR); cv.height = Math.ceil(SPR_H*DPR);
+  const c = cv.getContext('2d'); c.scale(DPR,DPR); c.translate(SPR_W/2, SPR_H/2);
+  const p = PALETTE[color];
+  // body
+  const g = c.createRadialGradient(-R*0.3,-R*0.4,2, 0,0,R*1.25);
+  g.addColorStop(0,p.light); g.addColorStop(0.45,p.base); g.addColorStop(1,p.dark);
+  c.beginPath(); c.ellipse(0,0,EGG_HW,EGG_HH,0,0,Math.PI*2); c.fillStyle=g; c.fill();
+  // baked speckles (deterministic per colour)
+  const rng = lcg(9871 + color*733);
+  c.fillStyle = p.spot; c.globalAlpha = 0.6;
+  const ns = 4 + Math.floor(rng()*3);
+  for(let i=0;i<ns;i++){ const a=rng()*Math.PI*2, rr=rng()*R*0.5;
+    const dx=Math.cos(a)*rr, dy=Math.sin(a)*rr*1.15, sr=1.6+rng()*2.4;
+    c.beginPath(); c.ellipse(dx,dy,sr,sr*0.85,0,0,Math.PI*2); c.fill(); }
+  c.globalAlpha = 1;
+  // outline
+  c.lineWidth=1.5; c.strokeStyle='rgba(0,0,0,0.22)';
+  c.beginPath(); c.ellipse(0,0,EGG_HW,EGG_HH,0,0,Math.PI*2); c.stroke();
+  // gloss
+  c.beginPath(); c.ellipse(-R*0.28,-R*0.44,R*0.27,R*0.16,-0.5,0,Math.PI*2);
+  c.fillStyle='rgba(255,255,255,0.6)'; c.fill();
+  // colour-blind symbol
+  c.globalAlpha = 0.5; c.fillStyle='rgba(0,0,0,0.62)';
+  if(color===0){ c.beginPath(); c.moveTo(0,-6); c.lineTo(5.5,5); c.lineTo(-5.5,5); c.closePath(); c.fill(); }
+  else if(color===1){ c.beginPath(); c.arc(0,1,5.5,0,Math.PI*2); c.fill(); }
+  else if(color===2){ c.fillRect(-4.5,-3.5,9,9); }
+  else if(color===3){ c.beginPath();
+    for(let i=0;i<5;i++){ const a=i*Math.PI*2/5-Math.PI/2; c.lineTo(Math.cos(a)*6,Math.sin(a)*6+1);
+      const b=a+Math.PI/5; c.lineTo(Math.cos(b)*2.5,Math.sin(b)*2.5+1); } c.closePath(); c.fill(); }
+  else if(color===4){ c.beginPath(); c.moveTo(0,-7); c.lineTo(5,0); c.lineTo(0,7); c.lineTo(-5,0); c.closePath(); c.fill(); }
+  else if(color===5){ c.fillRect(-1.5,-6,3,12); c.fillRect(-6,-1.5,12,3); }
+  c.globalAlpha = 1;
+  return cv;
+}
+function buildSprites(){ eggSprites = PALETTE.map((_,i)=>buildEggSprite(i)); }
+
+function drawEgg(x,y,color,scale=1,alpha=1,rot=0){
+  const spr = eggSprites[color];
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x,y);
+  if(rot) ctx.rotate(rot);
+  ctx.scale(scale,scale);
+  ctx.drawImage(spr, -SPR_W/2, -SPR_H/2, SPR_W, SPR_H);
+  ctx.restore();
+}
+
+// ───────────────────────────── background cache ─────────────────────
+let bgCanvas = null;
+function buildBackground(){
+  const cv = document.createElement('canvas');
+  cv.width = Math.ceil(W*DPR); cv.height = Math.ceil(H*DPR);
+  const c = cv.getContext('2d'); c.scale(DPR,DPR);
+  const sky = c.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,'#2a1448'); sky.addColorStop(0.5,'#3a1a40'); sky.addColorStop(1,'#1a0c28');
+  c.fillStyle=sky; c.fillRect(0,0,W,H);
+  // volcanoes
+  c.fillStyle='#241030';
+  c.beginPath(); c.moveTo(W*0.05,H*0.62); c.lineTo(W*0.30,H*0.30); c.lineTo(W*0.40,H*0.36); c.lineTo(W*0.60,H*0.62); c.closePath(); c.fill();
+  c.fillStyle='#3a1838';
+  c.beginPath(); c.moveTo(W*0.5,H*0.62); c.lineTo(W*0.78,H*0.34); c.lineTo(W*1.0,H*0.62); c.closePath(); c.fill();
+  c.fillStyle='rgba(255,120,0,0.5)';
+  c.beginPath(); c.ellipse(W*0.34,H*0.31,14,5,0,0,Math.PI*2); c.fill();
+  // ground
+  const gnd = c.createLinearGradient(0,H-90,0,H);
+  gnd.addColorStop(0,'#3a2a14'); gnd.addColorStop(1,'#1a1008');
+  c.fillStyle=gnd; c.fillRect(0,H-90,W,90);
+  // ceiling rock bar
+  const cap = c.createLinearGradient(0,0,0,CEIL_Y);
+  cap.addColorStop(0,'#5a4020'); cap.addColorStop(1,'#3a2810');
+  c.fillStyle=cap; c.fillRect(0,0,W,CEIL_Y);
+  c.fillStyle='#2a1c0a';
+  for(let x=0;x<W;x+=28){ c.beginPath(); c.moveTo(x,CEIL_Y); c.lineTo(x+10,CEIL_Y-7); c.lineTo(x+20,CEIL_Y); c.fill(); }
+  // vignette
+  const vg = c.createRadialGradient(W/2,H*0.46,H*0.30, W/2,H*0.5,H*0.72);
+  vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.45)');
+  c.fillStyle=vg; c.fillRect(0,0,W,H);
+  bgCanvas = cv;
+}
+const EMBERS = Array.from({length:34},()=>({ x:Math.random()*W, y:Math.random()*H*0.55, ph:Math.random()*6, r:0.6+Math.random()*1.4 }));
+
 // ───────────────────────────── level setup ──────────────────────────
 function buildLevel(){
   grid = []; rowParity = 0;
@@ -188,28 +334,23 @@ function buildLevel(){
   for(let r=0;r<startRows;r++){
     const row = [];
     const cols = colsForRow(r);
-    for(let c=0;c<cols;c++){
-      // leave the very bottom edges a bit sparse for variety
-      row.push(Math.random() < 0.92 ? makeEgg(randColor()) : null);
-    }
+    for(let c=0;c<cols;c++) row.push(Math.random() < 0.92 ? makeEgg(randColor()) : null);
     grid.push(row);
   }
   queue = [makeEgg(pickActiveColor()), makeEgg(pickActiveColor())];
   proj = null; combo = 0; nextIsBomb = false;
-  particles=[]; popping=[]; falling=[]; floaters=[]; scorePops=[];
+  particles=[]; popping=[]; falling=[]; scorePops=[];
   whirley=null; whirleyTimer=8; whirleyMsg=0; foot=null;
+  slide=0; recoil=0; hitstop=0; comboMsgT=0;
+  touchGrid();
   updateHUD();
 }
 
-// prefer colors that still exist on the board so shots stay useful
 function pickActiveColor(){
   const present = new Set();
   for(const row of grid) for(const e of row) if(e) present.add(e.color);
   if(present.size === 0) return randColor();
-  if(Math.random() < 0.8){
-    const arr = [...present];
-    return arr[Math.floor(Math.random()*arr.length)];
-  }
+  if(Math.random() < 0.8){ const arr=[...present]; return arr[Math.floor(Math.random()*arr.length)]; }
   return randColor();
 }
 
@@ -222,26 +363,26 @@ function shoot(){
   proj = { x: LAUNCH_X, y: LAUNCH_Y - 34, vx, vy, egg, bomb: nextIsBomb, spin: 0 };
   if(nextIsBomb){ nextIsBomb = false; }
   queue.push(makeEgg(pickActiveColor()));
-  shots++; updateHUD();
+  shots++; recoil = 1; updateHUD();
   sfxShoot();
 }
 
-function stepProjectile(){
+function stepProjectile(k){
   if(!proj) return;
-  const speed = 13, sub = 5, step = speed/sub;
+  const dist = 13 * k;
+  const sub = Math.max(1, Math.ceil(dist/3));
+  const step = dist/sub;
   for(let s=0;s<sub;s++){
     proj.x += proj.vx*step;
     proj.y += proj.vy*step;
     proj.spin += 0.3;
-    // wall bounce
     if(proj.x < CLAMP_MIN){ proj.x = CLAMP_MIN; proj.vx = Math.abs(proj.vx); }
     if(proj.x > CLAMP_MAX){ proj.x = CLAMP_MAX; proj.vx = -Math.abs(proj.vx); }
-    // ceiling
-    if(proj.y - R <= TOP_Y - ROW_H*0.5){ place(); return; }
-    // egg collision
+    if(proj.y - R <= CEIL_Y){ place(); return; }
     for(let r=0;r<grid.length;r++){
-      for(let c=0;c<colsForRow(r);c++){
-        if(!grid[r][c]) continue;
+      const row = grid[r];
+      for(let c=0;c<row.length;c++){
+        if(!row[c]) continue;
         const dx = proj.x - cellX(r,c), dy = proj.y - cellY(r);
         if(dx*dx + dy*dy < (D-3)*(D-3)){ place(); return; }
       }
@@ -271,17 +412,11 @@ function place(){
   if(!cell){ afterShot(false); return; }
   const [r,c] = cell;
   ensureRows(r);
+  egg.appear = 0;          // snap-in animation
   grid[r][c] = egg;
   const group = floodColor(r, c, egg.color);
   let popped = false;
-  if(group.length >= 3){
-    popGroup(group);
-    popped = true;
-    sfxPop(group.length);
-  } else {
-    // small bump feedback
-    egg.bump = 6;
-  }
+  if(group.length >= 3){ popGroup(group); popped = true; sfxPop(group.length); }
   dropFloating();
   afterShot(popped);
 }
@@ -289,18 +424,19 @@ function place(){
 function afterShot(popped){
   if(popped){
     combo++;
+    if(combo >= 3){ comboMsg = combo; comboMsgT = 1; }
     if(combo >= 4 && !nextIsBomb){ nextIsBomb = true; flash = 1; sfxThunder(); whirleyMsg = 90; }
   } else {
     combo = 0;
   }
   trimBottom();
   if(shots > 0 && shots % descendEvery === 0) descend();
+  touchGrid();
   if(boardEmpty()){ levelClear(); return; }
   checkGameOver();
   updateHUD();
 }
 
-// flood the same-color connected group
 function floodColor(r,c,color){
   const seen = new Set([r+','+c]), out=[[r,c]], stack=[[r,c]];
   while(stack.length){
@@ -326,10 +462,10 @@ function popGroup(cells){
   const gained = cells.length*10 + bonus;
   score += gained;
   addScorePop(cellX(cells[0][0],cells[0][1]), cellY(cells[0][0]), gained, combo);
-  shake = Math.min(10, 3 + cells.length*0.6);
+  shake = Math.min(11, 3 + cells.length*0.7);
+  if(cells.length >= 4) hitstop = Math.min(0.09, 0.04 + cells.length*0.008);
 }
 
-// any egg not connected to the top row falls
 function dropFloating(){
   const connected = new Set();
   const stack = [];
@@ -347,21 +483,19 @@ function dropFloating(){
     for(let c=0;c<colsForRow(r);c++){
       if(grid[r][c] && !connected.has(r+','+c)){
         const e = grid[r][c];
-        falling.push({ x:cellX(r,c), y:cellY(r), vx:rnd(-1.5,1.5), vy:rnd(-1,1), egg:e, rot:0, vr:rnd(-0.2,0.2) });
-        grid[r][c] = null;
-        dropped++;
+        falling.push({ x:cellX(r,c), y:cellY(r), vx:rnd(-1.5,1.5), vy:rnd(-1,1), color:e.color, rot:0, vr:rnd(-0.2,0.2) });
+        grid[r][c] = null; dropped++;
       }
     }
   }
   if(dropped){
-    score += dropped*25;
-    sfxDrop();
-    shake = Math.min(12, shake + dropped*0.5);
+    score += dropped*25; sfxDrop();
+    shake = Math.min(13, shake + dropped*0.5);
   }
 }
 
 function bombBlast(x,y){
-  flash = 1; sfxStomp(); shake = 16;
+  flash = 1; sfxStomp(); shake = 16; hitstop = 0.1;
   const rad = D*2.4;
   let hit = 0;
   for(let r=0;r<grid.length;r++){
@@ -376,8 +510,8 @@ function bombBlast(x,y){
       }
     }
   }
-  for(let i=0;i<30;i++){ const a=Math.random()*Math.PI*2, sp=rnd(2,8);
-    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,r:rnd(3,7),color:3,life:1,grav:0.1}); }
+  for(let i=0;i<28;i++){ const a=Math.random()*Math.PI*2, sp=rnd(2,8);
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,r:rnd(3,7),color:3,life:1,grav:0.1,shard:false}); }
   score += hit*15;
   addScorePop(x,y,hit*15,0);
   dropFloating();
@@ -387,40 +521,27 @@ function descend(){
   rowParity = 1 - rowParity;
   const len = colsForRow(0);
   const row = [];
-  for(let c=0;c<len;c++) row.push(Math.random()<0.95 ? makeEgg(pickActiveColor()) : null);
+  for(let c=0;c<len;c++){ const e = Math.random()<0.95 ? makeEgg(pickActiveColor()) : null; if(e) e.appear=0.2; row.push(e); }
   grid.unshift(row);
-  flash = 0.5;
+  slide = -ROW_H;        // start shifted up, ease down for a smooth slide
+  flash = Math.max(flash, 0.4);
+  touchGrid();
   checkGameOver();
 }
 
 function trimBottom(){
-  while(grid.length>0){
-    const last = grid[grid.length-1];
-    if(last.every(e=>!e)) grid.pop(); else break;
-  }
+  while(grid.length>0){ if(grid[grid.length-1].every(e=>!e)) grid.pop(); else break; }
 }
-
-function boardEmpty(){
-  for(const row of grid) for(const e of row) if(e) return false;
-  return true;
-}
-
+function boardEmpty(){ for(const row of grid) for(const e of row) if(e) return false; return true; }
 function checkGameOver(){
-  for(let r=0;r<grid.length;r++){
-    for(let c=0;c<colsForRow(r);c++){
+  for(let r=0;r<grid.length;r++)
+    for(let c=0;c<colsForRow(r);c++)
       if(grid[r][c] && cellY(r)+R >= DANGER_Y){ triggerStomp(); return; }
-    }
-  }
 }
-
-function triggerStomp(){
-  if(foot) return;
-  running = false;
-  foot = { y: -260, t: 0, done:false };
-}
+function triggerStomp(){ if(foot) return; running=false; syncMusic(); foot={ y:-260, t:0, done:false }; }
 
 function levelClear(){
-  running = false;
+  running=false; syncMusic();
   score += 1000 + level*250;
   level++;
   updateHUD();
@@ -430,34 +551,38 @@ function levelClear(){
 // ───────────────────────────── effects ──────────────────────────────
 function spawnBurst(x,y,color,n){
   for(let i=0;i<n;i++){ const a=Math.random()*Math.PI*2, sp=rnd(1,5);
-    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-1,r:rnd(2,5),color,life:1,grav:0.18}); }
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-1,r:rnd(2,5),color,life:1,grav:0.18,shard:false}); }
+  // eggshell shards
+  for(let i=0;i<3;i++){ const a=Math.random()*Math.PI*2, sp=rnd(2,5);
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-1.5,r:rnd(3,5),color,life:1,grav:0.3,shard:true,rot:Math.random()*6,vr:rnd(-0.4,0.4)}); }
 }
-function addScorePop(x,y,amt,combo){
-  scorePops.push({x,y,amt,combo,t:0});
-}
+function addScorePop(x,y,amt,combo){ scorePops.push({x,y,amt,combo,t:0}); }
 
 // ───────────────────────────── whirley ──────────────────────────────
-function updateWhirley(dt){
+function updateWhirley(dt,k){
   if(!running) return;
   whirleyTimer -= dt;
   if(!whirley && whirleyTimer<=0){
-    whirley = { x: -60, y: rnd(120, 200), egg: makeEgg(randColor()), dropped:false };
-    whirleyTimer = rnd(18, 28);
-    whirleyMsg = 120;
+    whirley = { x:-60, y:rnd(120,200), color:randColor(), dropped:false };
+    whirleyTimer = rnd(18,28); whirleyMsg = 120;
   }
   if(whirley){
-    whirley.x += 2.6;
-    whirley.y += Math.sin(whirley.x*0.03)*0.6;
-    if(whirley.x > W*0.5 && !whirley.dropped){
-      whirley.dropped = true;
-      descend(); // Whirley's pass pushes the nest down
-    }
+    whirley.x += 2.6*k;
+    whirley.y += Math.sin(whirley.x*0.03)*0.6*k;
+    if(whirley.x > W*0.5 && !whirley.dropped){ whirley.dropped = true; descend(); }
     if(whirley.x > W+80) whirley = null;
   }
   if(whirleyMsg>0) whirleyMsg -= dt*60;
 }
 
-// ───────────────────────────── aim preview ──────────────────────────
+// ───────────────────────────── aim preview (cached) ─────────────────
+let aimCache=null, lastAimAngle=999, lastAimVer=-1;
+function getAim(){
+  if(aimAngle!==lastAimAngle || gridVer!==lastAimVer){
+    aimCache = simulateAim(); lastAimAngle = aimAngle; lastAimVer = gridVer;
+  }
+  return aimCache;
+}
 function simulateAim(){
   let x=LAUNCH_X, y=LAUNCH_Y-34, vx=Math.cos(aimAngle), vy=Math.sin(aimAngle);
   const pts=[{x,y}]; const step=8;
@@ -466,7 +591,7 @@ function simulateAim(){
     if(x<CLAMP_MIN){ x=CLAMP_MIN; vx=Math.abs(vx); }
     if(x>CLAMP_MAX){ x=CLAMP_MAX; vx=-Math.abs(vx); }
     pts.push({x,y});
-    if(y-R<=TOP_Y-ROW_H*0.5) break;
+    if(y-R<=CEIL_Y) break;
     let hit=false;
     for(let r=0;r<grid.length && !hit;r++)
       for(let c=0;c<colsForRow(r);c++){
@@ -477,39 +602,43 @@ function simulateAim(){
     if(hit) break;
   }
   const last = pts[pts.length-1];
-  const target = findSnap(last.x, last.y);
-  return { pts, target };
+  return { pts, target: findSnap(last.x, last.y) };
 }
 
 // ───────────────────────────── update ───────────────────────────────
 function update(dt){
-  if(running && !paused){
-    stepProjectile();
-    updateWhirley(dt);
+  const k = clamp(dt*60, 0.2, 3);
+  // hit-stop: freeze the world a few frames for impact, then resume
+  if(hitstop>0){ hitstop = Math.max(0, hitstop-dt); }
+  else if(running && !paused){
+    stepProjectile(k);
+    updateWhirley(dt,k);
   }
-  // particles
-  for(const p of particles){ p.x+=p.vx; p.y+=p.vy; p.vy+=p.grav; p.life-=0.025; }
-  particles = particles.filter(p=>p.life>0);
-  // popping
-  for(const p of popping) p.t+=0.08;
-  popping = popping.filter(p=>p.t<1);
-  // falling
-  for(const f of falling){ f.x+=f.vx; f.y+=f.vy; f.vy+=0.45; f.rot+=f.vr; }
-  falling = falling.filter(f=>f.y < H+60);
-  // score pops
-  for(const s of scorePops){ s.t+=0.02; s.y-=0.6; }
-  scorePops = scorePops.filter(s=>s.t<1);
-  // egg bump anim
-  for(const row of grid) for(const e of row) if(e && e.bump) e.bump*=0.8, e.bump = e.bump<0.3?0:e.bump;
-  // shake / flash
-  shake *= 0.85; if(shake<0.2) shake=0;
-  flash *= 0.9; if(flash<0.02) flash=0;
-  // wobble idle
-  for(const row of grid) for(const e of row) if(e) e.wob += 0.03;
-  // foot stomp
+
+  // smooth descend slide
+  if(slide<0){ slide = Math.min(0, slide + ROW_H*5*dt); }
+
+  if(hitstop<=0){
+    for(const p of particles){ p.x+=p.vx*k; p.y+=p.vy*k; p.vy+=p.grav*k; if(p.shard) p.rot+=p.vr*k; p.life-=0.025*k; }
+    particles = particles.filter(p=>p.life>0);
+    for(const p of popping) p.t += 0.08*k;
+    popping = popping.filter(p=>p.t<1);
+    for(const f of falling){ f.x+=f.vx*k; f.y+=f.vy*k; f.vy+=0.45*k; f.rot+=f.vr*k; }
+    falling = falling.filter(f=>f.y < H+60);
+    for(const s of scorePops){ s.t += 0.02*k; s.y -= 0.6*k; }
+    scorePops = scorePops.filter(s=>s.t<1);
+  }
+
+  // egg idle wobble + snap-in
+  for(const row of grid) for(const e of row) if(e){ e.wob += 0.03*k; if(e.appear<1) e.appear = Math.min(1, e.appear + dt*6); }
+
+  recoil = Math.max(0, recoil - dt*5);
+  shake *= Math.pow(0.85,k); if(shake<0.2) shake=0;
+  flash *= Math.pow(0.9,k);  if(flash<0.02) flash=0;
+  if(comboMsgT>0) comboMsgT = Math.max(0, comboMsgT - dt*1.4);
+
   if(foot && !foot.done){
-    foot.t += dt;
-    foot.y += 14;
+    foot.y += 14*k;
     if(foot.y >= H-120){
       foot.y = H-120; foot.done = true; shake = 20; sfxStomp(); flash = 1;
       setTimeout(()=>{
@@ -521,73 +650,6 @@ function update(dt){
 }
 
 // ───────────────────────────── drawing ──────────────────────────────
-function drawEgg(x,y,color,scale=1,alpha=1,wob=0){
-  const p = PALETTE[color];
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.translate(x,y);
-  ctx.rotate(Math.sin(wob)*0.05);
-  ctx.scale(scale, scale*1.08);
-  // body
-  const g = ctx.createRadialGradient(-R*0.3,-R*0.4,2, 0,0,R*1.2);
-  g.addColorStop(0, p.light);
-  g.addColorStop(0.45, p.base);
-  g.addColorStop(1, p.dark);
-  ctx.beginPath();
-  ctx.ellipse(0,0,R*0.86,R,0,0,Math.PI*2);
-  ctx.fillStyle = g; ctx.fill();
-  // speckles
-  ctx.fillStyle = p.spot;
-  ctx.globalAlpha = alpha*0.7;
-  // (speckles drawn by caller-provided egg; here generic skip)
-  ctx.globalAlpha = alpha;
-  // outline
-  ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.stroke();
-  // gloss
-  ctx.beginPath();
-  ctx.ellipse(-R*0.28,-R*0.42,R*0.26,R*0.16,-0.5,0,Math.PI*2);
-  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.fill();
-  ctx.restore();
-}
-
-function drawEggObj(x,y,egg,scale=1,alpha=1){
-  const p = PALETTE[egg.color];
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.translate(x,y);
-  if(egg.wob!==undefined) ctx.rotate(Math.sin(egg.wob)*0.04);
-  const sc = scale * (egg.bump ? 1+egg.bump*0.02 : 1);
-  ctx.scale(sc, sc*1.08);
-  const g = ctx.createRadialGradient(-R*0.3,-R*0.4,2, 0,0,R*1.2);
-  g.addColorStop(0, p.light); g.addColorStop(0.45, p.base); g.addColorStop(1, p.dark);
-  ctx.beginPath(); ctx.ellipse(0,0,R*0.86,R,0,0,Math.PI*2);
-  ctx.fillStyle=g; ctx.fill();
-  // speckles
-  ctx.fillStyle = p.spot; ctx.globalAlpha = alpha*0.65;
-  for(const s of egg.spots){ ctx.beginPath(); ctx.ellipse(s.dx,s.dy,s.r,s.r*0.85,0,0,Math.PI*2); ctx.fill(); }
-  ctx.globalAlpha = alpha;
-  ctx.lineWidth=1.5; ctx.strokeStyle='rgba(0,0,0,0.22)'; ctx.stroke();
-  ctx.beginPath(); ctx.ellipse(-R*0.28,-R*0.42,R*0.26,R*0.15,-0.5,0,Math.PI*2);
-  ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.fill();
-  // color-blind symbol
-  ctx.globalAlpha = alpha * 0.55;
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  const sym = egg.color;
-  if(sym===0){ ctx.beginPath(); ctx.moveTo(0,-6); ctx.lineTo(5.5,5); ctx.lineTo(-5.5,5); ctx.closePath(); ctx.fill(); }
-  else if(sym===1){ ctx.beginPath(); ctx.arc(0,1,5.5,0,Math.PI*2); ctx.fill(); }
-  else if(sym===2){ ctx.fillRect(-4.5,-3.5,9,9); }
-  else if(sym===3){ // star
-    ctx.beginPath();
-    for(let i=0;i<5;i++){ const a=i*Math.PI*2/5-Math.PI/2; ctx.lineTo(Math.cos(a)*6,Math.sin(a)*6+1);
-      const b=a+Math.PI/5; ctx.lineTo(Math.cos(b)*2.5,Math.sin(b)*2.5+1); }
-    ctx.closePath(); ctx.fill();
-  }
-  else if(sym===4){ ctx.beginPath(); ctx.moveTo(0,-7); ctx.lineTo(5,0); ctx.lineTo(0,7); ctx.lineTo(-5,0); ctx.closePath(); ctx.fill(); }
-  else if(sym===5){ ctx.fillRect(-1.5,-6,3,12); ctx.fillRect(-6,-1.5,12,3); }
-  ctx.globalAlpha = alpha;
-  ctx.restore();
-}
-
 function drawBomb(x,y,scale=1){
   ctx.save(); ctx.translate(x,y); ctx.scale(scale,scale);
   const g = ctx.createRadialGradient(-6,-6,2,0,0,R);
@@ -595,83 +657,31 @@ function drawBomb(x,y,scale=1){
   ctx.beginPath(); ctx.arc(0,0,R*0.92,0,Math.PI*2); ctx.fillStyle=g; ctx.fill();
   ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.stroke();
   ctx.beginPath(); ctx.ellipse(-7,-7,4,2.5,-0.6,0,Math.PI*2); ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.fill();
-  // fuse
   ctx.strokeStyle='#a86'; ctx.lineWidth=3; ctx.beginPath();
   ctx.moveTo(4,-R*0.8); ctx.quadraticCurveTo(14,-R*1.1,10,-R*1.4); ctx.stroke();
-  // spark
   const fx=10, fy=-R*1.4;
-  ctx.fillStyle = Math.sin(Date.now()/60)>0?'#ffd23f':'#ff7000';
+  ctx.fillStyle = (Math.floor(animClock*16)%2) ? '#ffd23f' : '#ff7000';
   for(let i=0;i<5;i++){ const a=Math.random()*Math.PI*2,d=Math.random()*5;
     ctx.beginPath(); ctx.arc(fx+Math.cos(a)*d, fy+Math.sin(a)*d, 1.5, 0, Math.PI*2); ctx.fill(); }
   ctx.restore();
 }
 
-function drawBackground(){
-  // sky gradient
-  const sky = ctx.createLinearGradient(0,0,0,H);
-  sky.addColorStop(0,'#2a1448'); sky.addColorStop(0.5,'#3a1a40'); sky.addColorStop(1,'#1a0c28');
-  ctx.fillStyle = sky; ctx.fillRect(0,0,W,H);
-  // distant volcano
-  ctx.fillStyle = '#241030';
-  ctx.beginPath();
-  ctx.moveTo(W*0.05, H*0.62); ctx.lineTo(W*0.30, H*0.30); ctx.lineTo(W*0.40, H*0.36);
-  ctx.lineTo(W*0.60, H*0.62); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = '#3a1838';
-  ctx.beginPath();
-  ctx.moveTo(W*0.5, H*0.62); ctx.lineTo(W*0.78, H*0.34); ctx.lineTo(W*1.0, H*0.62);
-  ctx.closePath(); ctx.fill();
-  // lava glow on volcano top
-  ctx.fillStyle = 'rgba(255,120,0,0.5)';
-  ctx.beginPath(); ctx.ellipse(W*0.34, H*0.31, 14, 5, 0, 0, Math.PI*2); ctx.fill();
-  // stars / embers
-  ctx.fillStyle='rgba(255,200,120,0.5)';
-  for(const s of BG_STARS){ ctx.globalAlpha=0.3+0.3*Math.sin(Date.now()/600+s[2]); ctx.beginPath(); ctx.arc(s[0],s[1],s[3],0,Math.PI*2); ctx.fill(); }
-  ctx.globalAlpha=1;
-  // ground
-  const gnd = ctx.createLinearGradient(0,H-90,0,H);
-  gnd.addColorStop(0,'#3a2a14'); gnd.addColorStop(1,'#1a1008');
-  ctx.fillStyle=gnd; ctx.fillRect(0,H-90,W,90);
-  // ceiling rock bar where eggs hang
-  const cap = ctx.createLinearGradient(0,0,0,TOP_Y-ROW_H*0.5);
-  cap.addColorStop(0,'#5a4020'); cap.addColorStop(1,'#3a2810');
-  ctx.fillStyle=cap; ctx.fillRect(0,0,W,TOP_Y-ROW_H*0.5);
-  ctx.fillStyle='#2a1c0a';
-  for(let x=0;x<W;x+=28){ ctx.beginPath(); ctx.moveTo(x,TOP_Y-ROW_H*0.5); ctx.lineTo(x+10,TOP_Y-ROW_H*0.5-7); ctx.lineTo(x+20,TOP_Y-ROW_H*0.5); ctx.fill(); }
-}
-const BG_STARS = Array.from({length:40},()=>[Math.random()*W, Math.random()*H*0.55, Math.random()*6, 0.6+Math.random()*1.4]);
-
 function drawDino(){
-  // slingshot dino at the bottom
-  const x=LAUNCH_X, y=LAUNCH_Y;
-  ctx.save();
-  // pointing arm toward aim
-  ctx.translate(x,y);
-  // body
-  ctx.fillStyle='#4fb83a';
-  ctx.beginPath(); ctx.ellipse(0,28,46,34,0,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle='#8fe06a';
-  ctx.beginPath(); ctx.ellipse(0,36,30,22,0,0,Math.PI*2); ctx.fill();
-  // head turned up
-  ctx.fillStyle='#4fb83a';
-  ctx.beginPath(); ctx.ellipse(0,-6,30,26,0,0,Math.PI*2); ctx.fill();
-  // snout/launcher rotates toward aim
-  ctx.save();
-  ctx.rotate(aimAngle + Math.PI/2);
-  ctx.fillStyle='#3a9828';
-  ctx.beginPath(); ctx.ellipse(0,-26,15,22,0,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle='#2a7a1c';
-  ctx.beginPath(); ctx.ellipse(0,-34,10,8,0,0,Math.PI*2); ctx.fill();
+  const x=LAUNCH_X + Math.cos(aimAngle)*recoil*7;
+  const y=LAUNCH_Y - Math.sin(aimAngle)*recoil*7 + recoil*3;
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='#4fb83a'; ctx.beginPath(); ctx.ellipse(0,28,46,34,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#8fe06a'; ctx.beginPath(); ctx.ellipse(0,36,30,22,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#4fb83a'; ctx.beginPath(); ctx.ellipse(0,-6,30,26,0,0,Math.PI*2); ctx.fill();
+  ctx.save(); ctx.rotate(aimAngle + Math.PI/2);
+  ctx.fillStyle='#3a9828'; ctx.beginPath(); ctx.ellipse(0,-26,15,22,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#2a7a1c'; ctx.beginPath(); ctx.ellipse(0,-34,10,8,0,0,Math.PI*2); ctx.fill();
   ctx.restore();
-  // eyes
-  ctx.fillStyle='#fff';
-  ctx.beginPath(); ctx.arc(-12,-14,8,0,Math.PI*2); ctx.arc(12,-14,8,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(-12,-14,8,0,Math.PI*2); ctx.arc(12,-14,8,0,Math.PI*2); ctx.fill();
   ctx.fillStyle='#222';
   const ex=clamp(Math.cos(aimAngle)*3,-3,3), ey=clamp(Math.sin(aimAngle)*3,-3,1);
   ctx.beginPath(); ctx.arc(-12+ex,-14+ey,4,0,Math.PI*2); ctx.arc(12+ex,-14+ey,4,0,Math.PI*2); ctx.fill();
-  // nostrils
-  ctx.fillStyle='#2a7a1c';
-  ctx.beginPath(); ctx.arc(-4,2,1.6,0,Math.PI*2); ctx.arc(4,2,1.6,0,Math.PI*2); ctx.fill();
-  // spikes on back
+  ctx.fillStyle='#2a7a1c'; ctx.beginPath(); ctx.arc(-4,2,1.6,0,Math.PI*2); ctx.arc(4,2,1.6,0,Math.PI*2); ctx.fill();
   ctx.fillStyle='#e8d040';
   for(let i=-2;i<=2;i++){ ctx.beginPath(); ctx.moveTo(i*16-6,-22); ctx.lineTo(i*16,-40); ctx.lineTo(i*16+6,-22); ctx.fill(); }
   ctx.restore();
@@ -679,102 +689,118 @@ function drawDino(){
 
 function drawWhirley(){
   if(!whirley) return;
-  const {x,y,egg} = whirley;
+  const {x,y,color} = whirley;
   ctx.save(); ctx.translate(x,y);
-  // wings flap
-  const flap = Math.sin(Date.now()/80)*0.6;
+  const flap = Math.sin(animClock*12)*0.6;
   ctx.fillStyle='#b060d8';
-  ctx.save(); ctx.rotate(-0.5+flap);
-  ctx.beginPath(); ctx.ellipse(-20,-6,26,10,0,0,Math.PI*2); ctx.fill(); ctx.restore();
-  ctx.save(); ctx.rotate(0.5-flap);
-  ctx.beginPath(); ctx.ellipse(20,-6,26,10,0,0,Math.PI*2); ctx.fill(); ctx.restore();
-  // body
-  ctx.fillStyle='#9c40c8';
-  ctx.beginPath(); ctx.ellipse(0,2,16,12,0,0,Math.PI*2); ctx.fill();
-  // head + beak
+  ctx.save(); ctx.rotate(-0.5+flap); ctx.beginPath(); ctx.ellipse(-20,-6,26,10,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+  ctx.save(); ctx.rotate(0.5-flap); ctx.beginPath(); ctx.ellipse(20,-6,26,10,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+  ctx.fillStyle='#9c40c8'; ctx.beginPath(); ctx.ellipse(0,2,16,12,0,0,Math.PI*2); ctx.fill();
   ctx.beginPath(); ctx.ellipse(10,-6,9,8,0,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle='#ffb000'; ctx.beginPath();
-  ctx.moveTo(16,-8); ctx.lineTo(30,-4); ctx.lineTo(16,-2); ctx.fill();
+  ctx.fillStyle='#ffb000'; ctx.beginPath(); ctx.moveTo(16,-8); ctx.lineTo(30,-4); ctx.lineTo(16,-2); ctx.fill();
   ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(12,-8,3,0,Math.PI*2); ctx.fill();
   ctx.fillStyle='#222'; ctx.beginPath(); ctx.arc(13,-8,1.5,0,Math.PI*2); ctx.fill();
-  // carried egg
-  if(!whirley.dropped) drawEggObj(0,18,egg,0.8,1);
+  if(!whirley.dropped) drawEgg(0,18,color,0.8,1);
   ctx.restore();
 }
 
 function drawFoot(){
   if(!foot) return;
-  const x=W/2, y=foot.y;
-  ctx.save(); ctx.translate(x,y);
-  // leg
+  ctx.save(); ctx.translate(W/2, foot.y);
   ctx.fillStyle='#7a5a2a'; ctx.fillRect(-46,-260,92,260);
   ctx.fillStyle='#9c7438'; ctx.fillRect(-46,-260,18,260);
-  // foot
-  ctx.fillStyle='#8a6a34';
-  ctx.beginPath(); ctx.ellipse(0,0,90,46,0,0,Math.PI*2); ctx.fill();
-  // toes/claws
+  ctx.fillStyle='#8a6a34'; ctx.beginPath(); ctx.ellipse(0,0,90,46,0,0,Math.PI*2); ctx.fill();
   ctx.fillStyle='#e8e0d0';
   for(let i=-2;i<=2;i++){ ctx.beginPath(); ctx.moveTo(i*34-10,30); ctx.lineTo(i*34,52); ctx.lineTo(i*34+10,30); ctx.fill(); }
   ctx.restore();
 }
 
+let animClock = 0;
 function draw(){
   ctx.save();
   if(shake>0) ctx.translate(rnd(-shake,shake), rnd(-shake,shake));
-  drawBackground();
+
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+
+  // twinkling embers
+  for(const s of EMBERS){
+    ctx.globalAlpha = 0.25 + 0.3*Math.sin(animClock*1.6 + s.ph);
+    ctx.fillStyle = '#ffc878';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 
   // danger line
   ctx.save();
-  ctx.strokeStyle='rgba(255,60,60,'+(0.3+0.2*Math.sin(Date.now()/200))+')';
+  ctx.strokeStyle='rgba(255,60,60,'+(0.3+0.2*Math.sin(animClock*5))+')';
   ctx.setLineDash([10,8]); ctx.lineWidth=3;
   ctx.beginPath(); ctx.moveTo(0,DANGER_Y); ctx.lineTo(W,DANGER_Y); ctx.stroke();
   ctx.restore();
 
-  // aim preview
+  // aim preview (cached)
   if(running && !proj && !paused && !foot){
-    const {pts,target} = simulateAim();
+    const {pts,target} = getAim();
     ctx.save();
     ctx.fillStyle='rgba(255,240,180,0.85)';
     for(let i=4;i<pts.length;i+=3){ const a=1-i/pts.length;
       ctx.globalAlpha=0.2+a*0.6; ctx.beginPath(); ctx.arc(pts[i].x,pts[i].y,3,0,Math.PI*2); ctx.fill(); }
     ctx.globalAlpha=1; ctx.restore();
     if(target){
-      ctx.save(); ctx.strokeStyle='rgba(255,255,255,0.6)'; ctx.lineWidth=2; ctx.setLineDash([4,4]);
-      ctx.beginPath(); ctx.arc(cellX(target[0],target[1]),cellY(target[0]),R,0,Math.PI*2); ctx.stroke(); ctx.restore();
+      const pulse = 1 + 0.12*Math.sin(animClock*7);
+      ctx.save(); ctx.globalAlpha=0.5;
+      drawEgg(cellX(target[0],target[1]), cellY(target[0]), queue[0]?queue[0].color:0, pulse*0.96, 0.45);
+      ctx.strokeStyle='rgba(255,255,255,0.7)'; ctx.lineWidth=2; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(cellX(target[0],target[1]),cellY(target[0]),R*pulse,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
     }
   }
 
-  // grid eggs
-  for(let r=0;r<grid.length;r++)
-    for(let c=0;c<colsForRow(r);c++)
-      if(grid[r][c]) drawEggObj(cellX(r,c),cellY(r),grid[r][c]);
+  // grid eggs (with smooth-descend slide)
+  ctx.save();
+  ctx.translate(0, slide);
+  for(let r=0;r<grid.length;r++){
+    const row = grid[r];
+    for(let c=0;c<row.length;c++){
+      const e = row[c];
+      if(e) drawEgg(cellX(r,c), cellY(r), e.color, easeOutBack(e.appear), 1, Math.sin(e.wob)*0.04);
+    }
+  }
+  ctx.restore();
 
   // popping
-  for(const p of popping) drawEggObj(p.x,p.y,{color:p.color,spots:[],wob:0},1+p.t*0.7,1-p.t);
+  for(const p of popping) drawEgg(p.x,p.y,p.color,1+p.t*0.7,1-p.t);
 
   // falling
-  for(const f of falling){ ctx.save(); ctx.translate(f.x,f.y); ctx.rotate(f.rot); drawEggObj(0,0,f.egg,1,clamp((H-f.y)/120,0,1)); ctx.restore(); }
+  for(const f of falling) drawEgg(f.x,f.y,f.color,1,clamp((H-f.y)/120,0,1),f.rot);
 
   // particles
-  for(const p of particles){ ctx.save(); ctx.globalAlpha=p.life;
-    ctx.fillStyle=PALETTE[p.color].base; ctx.beginPath(); ctx.arc(p.x,p.y,p.r*p.life,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+  for(const p of particles){
+    ctx.save(); ctx.globalAlpha=Math.max(0,p.life);
+    if(p.shard){
+      ctx.translate(p.x,p.y); ctx.rotate(p.rot);
+      ctx.fillStyle=PALETTE[p.color].light;
+      ctx.beginPath(); ctx.moveTo(0,-p.r); ctx.lineTo(p.r*0.8,p.r*0.7); ctx.lineTo(-p.r*0.8,p.r*0.7); ctx.closePath(); ctx.fill();
+    } else {
+      ctx.fillStyle=PALETTE[p.color].base;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r*p.life,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
 
   drawWhirley();
   drawDino();
 
-  // projectile / loaded egg
-  if(proj){ if(proj.bomb) drawBomb(proj.x,proj.y); else drawEggObj(proj.x,proj.y,proj.egg); }
+  if(proj){ if(proj.bomb) drawBomb(proj.x,proj.y); else drawEgg(proj.x,proj.y,proj.egg.color,1,1,proj.spin*0.1); }
   else if(running && !foot){
-    // loaded egg sitting in launcher
     if(nextIsBomb) drawBomb(LAUNCH_X,LAUNCH_Y-34);
-    else if(queue[0]) drawEggObj(LAUNCH_X,LAUNCH_Y-34,queue[0]);
+    else if(queue[0]) drawEgg(LAUNCH_X,LAUNCH_Y-34,queue[0].color,1,1,Math.sin(animClock*2)*0.05);
   }
 
   // next-egg preview
   ctx.save();
   ctx.fillStyle='rgba(0,0,0,0.4)'; roundRect(W-92,H-50,84,40,8); ctx.fill();
   ctx.fillStyle='#ffe9a0'; ctx.font='bold 11px Trebuchet MS'; ctx.fillText('NEXT',W-84,H-34);
-  if(queue[1]) drawEggObj(W-32,H-30,queue[1],0.78);
+  if(queue[1]) drawEgg(W-32,H-30,queue[1].color,0.78);
   ctx.restore();
 
   // score pops
@@ -785,23 +811,32 @@ function draw(){
   ctx.textAlign='left';
 
   drawFoot();
-  ctx.restore();
+  ctx.restore();  // end shake
 
-  // combo / whirley banner
+  // combo callout
+  if(comboMsgT>0){
+    ctx.save(); ctx.textAlign='center';
+    const sc = 1 + (1-comboMsgT)*0.4;
+    ctx.globalAlpha = clamp(comboMsgT*1.5,0,1);
+    ctx.translate(W/2, 220); ctx.scale(sc,sc);
+    ctx.font='900 38px Trebuchet MS'; ctx.lineWidth=5; ctx.strokeStyle='#000';
+    ctx.fillStyle='#ffd23f';
+    ctx.strokeText('COMBO x'+comboMsg+'!',0,0); ctx.fillText('COMBO x'+comboMsg+'!',0,0);
+    ctx.restore(); ctx.textAlign='left';
+  }
+
+  // whirley / bomb banner
   if(whirleyMsg>0){
     ctx.save(); ctx.globalAlpha=clamp(whirleyMsg/30,0,1);
     ctx.font='900 30px Trebuchet MS'; ctx.textAlign='center';
-    ctx.fillStyle = nextIsBomb ? '#ff5b5b' : '#9be870';
-    ctx.strokeStyle='#000'; ctx.lineWidth=4;
+    ctx.fillStyle = nextIsBomb ? '#ff5b5b' : '#9be870'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
     const t = nextIsBomb ? '⚡ MEGA COMBO! BOMB READY! ⚡' : "WHIRLEY'S COMING!";
     ctx.strokeText(t,W/2,140); ctx.fillText(t,W/2,140);
     ctx.restore(); ctx.textAlign='left';
   }
 
-  // flash overlay
   if(flash>0){ ctx.fillStyle='rgba(255,240,200,'+flash*0.4+')'; ctx.fillRect(0,0,W,H); }
 
-  // pause overlay
   if(paused && running){
     ctx.fillStyle='rgba(0,0,0,0.52)'; ctx.fillRect(0,0,W,H);
     ctx.save(); ctx.textAlign='center';
@@ -819,6 +854,7 @@ function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w
 // ───────────────────────────── loop ─────────────────────────────────
 function loop(t){
   const dt = Math.min(0.05, (t-lastT)/1000) || 0.016; lastT=t;
+  animClock += dt;
   update(dt);
   draw();
   animId = requestAnimationFrame(loop);
@@ -849,38 +885,36 @@ function showOverlay(msg, sub, btn){
 playBtn.addEventListener('click', ()=>{
   ensureAudio(); sfxClick();
   overlay.classList.add('hidden');
-  // fresh game if score reset (game over) else continue/next level
   if(msgEl.textContent==='GAME OVER' || titleEl.classList.contains('hidden')===false){
     score=0; level=1; shots=0;
   }
   shots=0;
   buildLevel();
   running=true; paused=false;
+  syncMusic();
   if(!animId){ lastT=performance.now(); animId=requestAnimationFrame(loop); }
 });
 
-// when continuing after a level, build is handled above; but for the very first
-// frame we still want the canvas to render the idle scene:
+// ── boot ──
+buildSprites();
+buildBackground();
 buildLevel(); running=false;
 lastT=performance.now(); animId=requestAnimationFrame(loop);
 
 // ───────────────────────────── input ────────────────────────────────
 canvas.addEventListener('mousemove', e=>{
   const r = canvas.getBoundingClientRect();
-  const mx = (e.clientX-r.left) * (W/r.width);
-  const my = (e.clientY-r.top) * (H/r.height);
-  aim(mx,my);
+  aim((e.clientX-r.left)*(W/r.width), (e.clientY-r.top)*(H/r.height));
 });
 function aim(mx,my){
   let dx = mx-LAUNCH_X, dy = my-(LAUNCH_Y-20);
-  if(dy > -10) dy = -10; // keep shots heading upward
-  aimAngle = Math.atan2(dy,dx);
-  aimAngle = clamp(aimAngle, -Math.PI+0.18, -0.18);
+  if(dy > -10) dy = -10;
+  aimAngle = clamp(Math.atan2(dy,dx), -Math.PI+0.18, -0.18);
 }
 canvas.addEventListener('click', ()=> shoot());
 window.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault(); shoot(); }
-  if(e.code==='KeyP'){ paused=!paused; }
+  if(e.code==='KeyP'){ paused=!paused; syncMusic(); }
 });
 canvas.addEventListener('touchmove', e=>{ e.preventDefault();
   const r=canvas.getBoundingClientRect(), t=e.touches[0];
@@ -892,6 +926,7 @@ document.getElementById('soundBtn').addEventListener('click', ()=>{
   audioOn=!audioOn;
   document.getElementById('soundBtn').textContent = audioOn?'🔊 SND':'🔇 SND';
   if(audioOn){ ensureAudio(); sfxClick(); }
+  syncMusic();
 });
 </script>
 </body>
